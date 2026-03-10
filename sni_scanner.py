@@ -1,289 +1,79 @@
 #!/usr/bin/env python3
 """
 SNI VLESS Scanner
-Ищет сайты в той же подсети или ASN, подходящие для SNI VLESS проксирования.
-Использование: python3 sni_scanner.py <IP> [--mode subnet|asn|both] [--threads 50] [--timeout 3]
+Ищет сайты в одной подсети или ASN, подходящие для SNI VLESS проксирования.
+
+Логика проверки каждого IP:
+  1. rDNS         → получаем hostname
+  2. DNS-резолвинг hostname → проверяем что домен смотрит на этот IP
+  3. TLS/SNI      → версия, ALPN, CN из сертификата
+  4. HTTP GET /   → статус, title, location, server
+
+В лог пишутся ВСЕ IP с причиной отсева на каждом шаге.
+В txt только успешные кандидаты: домен + IP + что за сайт.
+
+Использование:
+  python sni_scanner.py <IP> [--mode subnet|asn|both] [--threads 50] [--timeout 3]
 """
 
 import argparse
 import ipaddress
+import os
+import re
 import socket
 import ssl
 import sys
 import json
-import subprocess
-import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
-# Попытка импортировать опциональные зависимости
 try:
     import requests
     HAS_REQUESTS = True
 except ImportError:
     HAS_REQUESTS = False
 
-try:
-    import urllib.request
-    import urllib.error
-except ImportError:
-    pass
+import urllib.request
 
 
 # ──────────────────────────────────────────────
-# Утилиты получения информации об IP
+# Получение информации об IP / ASN
 # ──────────────────────────────────────────────
 
 def get_ip_info(ip: str) -> dict:
-    """Получить информацию об IP через ipinfo.io (ASN, подсеть, страна)."""
     url = f"https://ipinfo.io/{ip}/json"
     try:
         if HAS_REQUESTS:
-            r = requests.get(url, timeout=5)
-            return r.json()
-        else:
-            with urllib.request.urlopen(url, timeout=5) as resp:
-                return json.loads(resp.read().decode())
+            return requests.get(url, timeout=5).json()
+        with urllib.request.urlopen(url, timeout=5) as r:
+            return json.loads(r.read().decode())
     except Exception as e:
-        print(f"[!] Не удалось получить ipinfo для {ip}: {e}")
+        print(f"[!] ipinfo недоступен: {e}")
         return {}
 
 
 def get_asn_prefixes(asn: str) -> list:
-    """
-    Получить список IP-префиксов для ASN через bgpview.io API.
-    ASN в формате 'AS12345' или '12345'.
-    """
     asn_num = asn.upper().lstrip("AS")
     url = f"https://api.bgpview.io/asn/{asn_num}/prefixes"
-    prefixes = []
     try:
         if HAS_REQUESTS:
-            r = requests.get(url, timeout=10)
-            data = r.json()
+            data = requests.get(url, timeout=10).json()
         else:
-            with urllib.request.urlopen(url, timeout=10) as resp:
-                data = json.loads(resp.read().decode())
-
-        for p in data.get("data", {}).get("ipv4_prefixes", []):
-            prefixes.append(p["prefix"])
+            with urllib.request.urlopen(url, timeout=10) as r:
+                data = json.loads(r.read().decode())
+        return [p["prefix"] for p in data.get("data", {}).get("ipv4_prefixes", [])]
     except Exception as e:
-        print(f"[!] Не удалось получить префиксы для {asn}: {e}")
-    return prefixes
+        print(f"[!] bgpview недоступен: {e}")
+        return []
 
 
-def subnet_from_ip(ip: str, prefix_len: int = 24) -> str:
-    """Вернуть подсеть /prefix_len для заданного IP."""
-    net = ipaddress.ip_network(f"{ip}/{prefix_len}", strict=False)
-    return str(net)
-
-
-# ──────────────────────────────────────────────
-# Проверка хоста на пригодность для SNI VLESS
-# ──────────────────────────────────────────────
-
-def check_tls_sni(ip: str, hostname: str, port: int = 443, timeout: float = 3.0) -> dict:
-    """
-    Проверяет TLS-рукопожатие с заданным SNI (hostname) на IP:port.
-    Возвращает словарь с результатом.
-    """
-    result = {
-        "ip": ip,
-        "hostname": hostname,
-        "port": port,
-        "tls_ok": False,
-        "cert_cn": None,
-        "alpn": None,
-        "tls_version": None,
-        "http2": False,
-        "error": None,
-    }
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-
-    try:
-        with socket.create_connection((ip, port), timeout=timeout) as sock:
-            with ctx.wrap_socket(sock, server_hostname=hostname) as tls:
-                result["tls_ok"] = True
-                result["tls_version"] = tls.version()
-                alpn = tls.selected_alpn_protocol()
-                result["alpn"] = alpn
-                result["http2"] = (alpn == "h2")
-
-                cert = tls.getpeercert()
-                if cert:
-                    for field in cert.get("subject", ()):
-                        for k, v in field:
-                            if k == "commonName":
-                                result["cert_cn"] = v
-    except ssl.SSLError as e:
-        result["error"] = f"SSL: {e}"
-    except (socket.timeout, ConnectionRefusedError, OSError) as e:
-        result["error"] = str(e)
-    except Exception as e:
-        result["error"] = str(e)
-
-    return result
-
-
-def check_http_header(ip: str, hostname: str, port: int = 443, timeout: float = 3.0) -> bool:
-    """Быстрая проверка: отвечает ли сервер хоть каким-то HTTP ответом."""
-    try:
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        with socket.create_connection((ip, port), timeout=timeout) as s:
-            with ctx.wrap_socket(s, server_hostname=hostname) as tls:
-                req = (
-                    f"HEAD / HTTP/1.1\r\nHost: {hostname}\r\n"
-                    "User-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n"
-                )
-                tls.sendall(req.encode())
-                resp = tls.recv(512).decode(errors="ignore")
-                return resp.startswith("HTTP/")
-    except Exception:
-        return False
-
-
-def is_good_sni_candidate(result: dict) -> bool:
-    """
-    Эвристика: хост подходит для SNI VLESS если:
-    - TLS установлен успешно
-    - Поддерживает TLS 1.2 или 1.3
-    - Желательно h2 (HTTP/2)
-    """
-    if not result["tls_ok"]:
-        return False
-    if result["tls_version"] not in ("TLSv1.2", "TLSv1.3"):
-        return False
-    return True
-
-
-# ──────────────────────────────────────────────
-# Обратный DNS и поиск hostname по IP
-# ──────────────────────────────────────────────
-
-def reverse_dns(ip: str) -> str | None:
-    """Попытка получить hostname через обратный DNS."""
-    try:
-        return socket.gethostbyaddr(ip)[0]
-    except Exception:
-        return None
-
-
-def get_hostname_from_cert(ip: str, port: int = 443, timeout: float = 3.0) -> str | None:
-    """Получить CN/SAN из TLS-сертификата без SNI."""
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    try:
-        with socket.create_connection((ip, port), timeout=timeout) as s:
-            with ctx.wrap_socket(s) as tls:
-                cert = tls.getpeercert()
-                if cert:
-                    # CN
-                    for field in cert.get("subject", ()):
-                        for k, v in field:
-                            if k == "commonName":
-                                return v
-                    # SAN
-                    for tp, val in cert.get("subjectAltName", ()):
-                        if tp == "DNS":
-                            return val
-    except Exception:
-        pass
-    return None
-
-
-def discover_hostnames(ip: str, timeout: float = 3.0) -> list:
-    """
-    Собирает возможные hostname для IP:
-    1. Обратный DNS
-    2. CN из сертификата (без SNI)
-    """
-    hosts = []
-    rdns = reverse_dns(ip)
-    if rdns:
-        hosts.append(rdns)
-    cert_cn = get_hostname_from_cert(ip, timeout=timeout)
-    if cert_cn and cert_cn not in hosts:
-        # CN может быть wildcard — берём как есть для проверки
-        hosts.append(cert_cn)
-    return hosts
-
-
-# ──────────────────────────────────────────────
-# Сканирование диапазона IP
-# ──────────────────────────────────────────────
-
-def scan_ip(ip: str, timeout: float, port: int = 443) -> dict | None:
-    """
-    Сканирует один IP:
-    - Определяет hostname(s)
-    - Проверяет TLS/SNI
-    Возвращает dict результата или None если не подходит.
-    """
-    hostnames = discover_hostnames(ip, timeout=timeout)
-
-    if not hostnames:
-        # Попробуем всё равно подключиться без SNI — просто проверить порт
-        result = check_tls_sni(ip, ip, port=port, timeout=timeout)
-        if is_good_sni_candidate(result):
-            result["hostname"] = ip
-            return result
-        return None
-
-    best = None
-    for host in hostnames:
-        result = check_tls_sni(ip, host, port=port, timeout=timeout)
-        if is_good_sni_candidate(result):
-            if best is None or (result["http2"] and not best["http2"]):
-                best = result
-    return best
-
-
-def scan_range(ips: list, timeout: float, threads: int, port: int = 443) -> list:
-    """Параллельное сканирование списка IP."""
-    results = []
-    total = len(ips)
-    done = 0
-
-    with ThreadPoolExecutor(max_workers=threads) as ex:
-        futures = {ex.submit(scan_ip, ip, timeout, port): ip for ip in ips}
-        for fut in as_completed(futures):
-            done += 1
-            ip = futures[fut]
-            try:
-                res = fut.result()
-                if res:
-                    results.append(res)
-                    mark = "✓ h2" if res.get("http2") else "✓"
-                    print(f"  [{mark}] {ip:16s}  SNI: {res['hostname']:<40s}  {res['tls_version']}")
-            except Exception as e:
-                pass
-            # Прогресс
-            if done % 20 == 0 or done == total:
-                pct = done / total * 100
-                print(f"  Прогресс: {done}/{total} ({pct:.0f}%)", end="\r", flush=True)
-
-    print()
-    return results
-
-
-# ──────────────────────────────────────────────
-# Генерация IP-адресов из подсетей
-# ──────────────────────────────────────────────
-
-def ips_from_prefixes(prefixes: list, max_hosts: int = 2000) -> list:
-    """Генерирует список IP из набора CIDR-префиксов, ограниченный max_hosts."""
+def ips_from_prefixes(prefixes: list, max_hosts: int) -> list:
     all_ips = []
     for prefix in prefixes:
         try:
             net = ipaddress.ip_network(prefix, strict=False)
-            # Пропускаем слишком большие сети, берём первые хосты
-            hosts = list(net.hosts())
-            all_ips.extend([str(h) for h in hosts])
+            all_ips.extend(str(h) for h in net.hosts())
             if len(all_ips) >= max_hosts:
                 break
         except ValueError:
@@ -291,146 +81,501 @@ def ips_from_prefixes(prefixes: list, max_hosts: int = 2000) -> list:
     return all_ips[:max_hosts]
 
 
+def subnet_ips(ip: str, prefix_len: int) -> list:
+    net = ipaddress.ip_network(f"{ip}/{prefix_len}", strict=False)
+    return [str(h) for h in net.hosts()]
+
+
 # ──────────────────────────────────────────────
-# Вывод результатов
+# Шаг 1: rDNS
+# ──────────────────────────────────────────────
+
+def rdns(ip: str) -> str | None:
+    try:
+        return socket.gethostbyaddr(ip)[0]
+    except Exception:
+        return None
+
+
+# ──────────────────────────────────────────────
+# Шаг 2: DNS-резолвинг — проверяем что домен смотрит на этот IP
+# ──────────────────────────────────────────────
+
+def resolve_hostname(hostname: str) -> list:
+    """Возвращает список всех A-записей для hostname."""
+    try:
+        infos = socket.getaddrinfo(hostname, None, socket.AF_INET)
+        return list({i[4][0] for i in infos})
+    except Exception:
+        return []
+
+
+# ──────────────────────────────────────────────
+# Шаг 3: TLS / SNI + извлечение CN из сертификата
+# ──────────────────────────────────────────────
+
+def _cn_from_der(der: bytes) -> str | None:
+    """Извлекает CN/SAN из DER без verify — getpeercert() пустой при CERT_NONE."""
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.backends import default_backend
+        cert = x509.load_der_x509_certificate(der, default_backend())
+        try:
+            san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+            dns_names = san.value.get_values_for_type(x509.DNSName)
+            if dns_names:
+                return dns_names[0]
+        except Exception:
+            pass
+        attrs = cert.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)
+        return attrs[0].value if attrs else None
+    except ImportError:
+        pass
+    except Exception:
+        return None
+
+    # Fallback: ищем OID 55 04 03 (commonName) прямо в байтах DER
+    try:
+        i = 0
+        while i < len(der) - 5:
+            if der[i:i+3] == b'\x55\x04\x03':
+                i += 4  # пропускаем тип строки
+                length = der[i]; i += 1
+                if length < 128 and i + length <= len(der):
+                    cn = der[i:i+length].decode("utf-8", errors="replace")
+                    if "." in cn or len(cn) > 3:
+                        return cn
+            i += 1
+    except Exception:
+        pass
+    return None
+
+
+def check_tls(ip: str, hostname: str, port: int, timeout: float) -> dict:
+    r = {"ok": False, "version": None, "alpn": None, "h2": False,
+         "cert_cn": None, "error": None}
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        with socket.create_connection((ip, port), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=hostname) as tls:
+                r["ok"]      = True
+                r["version"] = tls.version()
+                r["alpn"]    = tls.selected_alpn_protocol()
+                r["h2"]      = (r["alpn"] == "h2")
+                der = tls.getpeercert(binary_form=True)
+                if der:
+                    r["cert_cn"] = _cn_from_der(der)
+    except ssl.SSLError as e:
+        r["error"] = f"ssl:{e}"
+    except (socket.timeout, TimeoutError):
+        r["error"] = "tls_timeout"
+    except ConnectionRefusedError:
+        r["error"] = "refused"
+    except OSError as e:
+        r["error"] = f"oserr:{e.errno}"
+    except Exception as e:
+        r["error"] = f"err:{type(e).__name__}"
+    return r
+
+
+# ──────────────────────────────────────────────
+# Шаг 4: HTTP GET /
+# ──────────────────────────────────────────────
+
+def check_http(ip: str, hostname: str, port: int, timeout: float) -> dict:
+    r = {"status": None, "server": "", "location": "", "title": "",
+         "no_http": False, "error": None}
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        with socket.create_connection((ip, port), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=hostname) as tls:
+                req = (
+                    f"GET / HTTP/1.1\r\nHost: {hostname}\r\n"
+                    "User-Agent: Mozilla/5.0\r\n"
+                    "Accept: text/html\r\nConnection: close\r\n\r\n"
+                )
+                tls.sendall(req.encode())
+                raw = b""
+                while len(raw) < 8192:
+                    chunk = tls.recv(4096)
+                    if not chunk:
+                        break
+                    raw += chunk
+                text = raw.decode(errors="ignore")
+                if not text.startswith("HTTP/"):
+                    r["no_http"] = True
+                    return r
+                lines = text.split("\r\n")
+                try:
+                    r["status"] = int(lines[0].split()[1])
+                except Exception:
+                    pass
+                for line in lines[1:]:
+                    ll = line.lower()
+                    if ll.startswith("server:"):
+                        r["server"] = line.split(":", 1)[1].strip()
+                    elif ll.startswith("location:"):
+                        r["location"] = line.split(":", 1)[1].strip()
+                m = re.search(r"<title[^>]*>([^<]{1,80})</title>", text, re.IGNORECASE)
+                if m:
+                    r["title"] = m.group(1).strip()
+    except (socket.timeout, TimeoutError):
+        r["error"] = "http_timeout"
+    except Exception as e:
+        r["error"] = f"err:{type(e).__name__}"
+    return r
+
+
+# ──────────────────────────────────────────────
+# Полная проверка одного IP
+# ──────────────────────────────────────────────
+
+def scan_ip(ip: str, port: int, timeout: float) -> dict:
+    result = {
+        "ip":            ip,
+        "hostname":      None,
+        "dns_ips":       [],
+        "dns_match":     False,
+        "tls_ok":        False,
+        "tls_version":   None,
+        "alpn":          None,
+        "h2":            False,
+        "cert_cn":       None,
+        "http_status":   None,
+        "http_server":   "",
+        "http_location": "",
+        "http_title":    "",
+        "no_http":       False,
+        "good":          False,
+        "fail_step":     None,
+        "fail_reason":   None,
+    }
+
+    # Шаг 1: rDNS
+    hostname = rdns(ip)
+    if not hostname:
+        result["fail_step"]   = "rdns"
+        result["fail_reason"] = "no_rdns"
+        return result
+    result["hostname"] = hostname
+
+    # Шаг 2: DNS → должен резолвиться на этот IP
+    dns_ips = resolve_hostname(hostname)
+    result["dns_ips"] = dns_ips
+    if ip not in dns_ips:
+        result["fail_step"]   = "dns"
+        result["fail_reason"] = f"dns_mismatch({','.join(dns_ips) if dns_ips else 'nxdomain'})"
+        return result
+    result["dns_match"] = True
+
+    # Шаг 3: TLS
+    tls = check_tls(ip, hostname, port, timeout)
+    result.update({
+        "tls_ok":      tls["ok"],
+        "tls_version": tls["version"],
+        "alpn":        tls["alpn"],
+        "h2":          tls["h2"],
+        "cert_cn":     tls["cert_cn"],
+    })
+    if not tls["ok"]:
+        result["fail_step"]   = "tls"
+        result["fail_reason"] = tls["error"]
+        return result
+    if tls["version"] not in ("TLSv1.2", "TLSv1.3"):
+        result["fail_step"]   = "tls"
+        result["fail_reason"] = f"old_tls:{tls['version']}"
+        return result
+
+    # Проверка CN — сертификат должен относиться к этому домену.
+    # Если cert_cn чужой (например *.telegram.org на shikado.mooo.com) —
+    # это прокси, не настоящий сайт, для SNI не подходит.
+    cert_cn = tls["cert_cn"] or ""
+    cn_base = cert_cn.lstrip("*.")
+    cn_match = (
+        cert_cn == hostname
+        or cert_cn == f"*.{hostname.split('.', 1)[-1]}"
+        or (cn_base and hostname.endswith("." + cn_base))
+        or cn_base == hostname
+    )
+    if not cn_match:
+        result["fail_step"]   = "cert"
+        result["fail_reason"] = f"cert_mismatch({cert_cn})"
+        return result
+
+    # Шаг 4: HTTP
+    http = check_http(ip, hostname, port, timeout)
+    result.update({
+        "http_status":   http["status"],
+        "http_server":   http["server"],
+        "http_location": http["location"],
+        "http_title":    http["title"],
+        "no_http":       http["no_http"],
+    })
+    if http["no_http"]:
+        result["fail_step"]   = "http"
+        result["fail_reason"] = "no_http_response(reality?)"
+        return result
+    if http["error"]:
+        result["fail_step"]   = "http"
+        result["fail_reason"] = http["error"]
+        return result
+    if not http["status"]:
+        result["fail_step"]   = "http"
+        result["fail_reason"] = "no_status"
+        return result
+
+    result["good"] = True
+    return result
+
+
+# ──────────────────────────────────────────────
+# Запись результатов
+# ──────────────────────────────────────────────
+
+class ResultWriter:
+    """
+    Атомарная инкрементальная запись через .tmp + os.replace.
+    .txt — только успешные кандидаты: домен / IP / сайт
+    .log — ВСЕ проверенные IP с результатом каждого шага
+    """
+
+    def __init__(self, txt_path: str, log_path: str):
+        self.txt_path    = txt_path
+        self.log_path    = log_path
+        self._good: list = []
+        self._log:  list = []
+        self.total       = 0
+        self.passed      = 0
+
+    def add(self, r: dict):
+        self.total += 1
+        ts       = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ip       = r["ip"]
+        hostname = r["hostname"] or ""
+
+        # Строим цепочку шагов — каждый OK или FAIL с деталями
+        steps = []
+
+        # rdns
+        if hostname:
+            steps.append(f"rdns=OK({hostname})")
+        else:
+            steps.append("rdns=FAIL(no_rdns)")
+
+        # dns
+        if r["fail_step"] != "rdns":
+            if r["dns_match"]:
+                steps.append(f"dns=OK({ip})")
+            else:
+                resolved = ",".join(r["dns_ips"][:3]) if r["dns_ips"] else "nxdomain"
+                steps.append(f"dns=FAIL(resolves_to={resolved})")
+
+        # tls
+        if r["fail_step"] not in ("rdns", "dns"):
+            if r["tls_ok"]:
+                alpn = "h2" if r["h2"] else "h1"
+                steps.append(f"tls=OK({r['tls_version']}/{alpn})")
+            else:
+                steps.append(f"tls=FAIL({r['fail_reason']})")
+
+        # cert
+        if r["fail_step"] not in ("rdns", "dns", "tls"):
+            cert_cn = r["cert_cn"] or ""
+            if r["fail_step"] == "cert":
+                steps.append(f"cert=FAIL({cert_cn} != hostname)")
+            else:
+                steps.append(f"cert=OK({cert_cn})" if cert_cn else "cert=OK")
+
+        # http
+        if r["fail_step"] not in ("rdns", "dns", "tls", "cert"):
+            if r["good"]:
+                title = f'"{r["http_title"][:40]}"' if r["http_title"] else ""
+                loc   = f">{r['http_location'][:40]}" if r["http_location"] else ""
+                srv   = f"[{r['http_server'][:20]}]" if r["http_server"] else ""
+                info  = " ".join(filter(None, [str(r["http_status"]), title, loc, srv]))
+                steps.append(f"http=OK({info})")
+            else:
+                steps.append(f"http=FAIL({r['fail_reason']})")
+
+        status = "PASS" if r["good"] else "FAIL"
+        self._log.append(f"[{ts}] {status}  {ip:<16}  " + "  |  ".join(steps))
+
+        if r["good"]:
+            self.passed += 1
+            site = r["http_title"] or r["http_location"] or str(r["http_status"] or "")
+            self._good.append(f"{hostname:<45}  {ip:<16}  {site[:60]}")
+
+        self._flush()
+
+    def _flush(self):
+        self._write_atomic(self.txt_path, "\n".join(self._good) + "\n" if self._good else "")
+        self._write_atomic(self.log_path, "\n".join(self._log)  + "\n" if self._log  else "")
+
+    @staticmethod
+    def _write_atomic(path: str, content: str):
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(content)
+            os.replace(tmp, path)
+        except Exception as e:
+            print(f"[!] Ошибка записи {path}: {e}")
+
+    def finalize(self):
+        self._flush()
+        print(
+            f"\n  Проверено: {self.total}  |  Кандидатов: {self.passed}\n"
+            f"  Домены : {self.txt_path}\n"
+            f"  Лог    : {self.log_path}"
+        )
+
+
+# ──────────────────────────────────────────────
+# Сканирование диапазона
+# ──────────────────────────────────────────────
+
+def scan_range(ips: list, port: int, timeout: float,
+               threads: int, writer: ResultWriter) -> list:
+    good  = []
+    total = len(ips)
+    done  = 0
+
+    with ThreadPoolExecutor(max_workers=threads) as ex:
+        futures = {ex.submit(scan_ip, ip, port, timeout): ip for ip in ips}
+        for fut in as_completed(futures):
+            done += 1
+            try:
+                r = fut.result()
+                writer.add(r)
+                if r["good"]:
+                    good.append(r)
+                    mark = "h2" if r["h2"] else "h1"
+                    site = r["http_title"] or r["http_location"] or str(r["http_status"] or "")
+                    print(f"  ✓ {r['ip']:<16}  {r['hostname']:<42}  {mark}  {site[:50]}")
+            except Exception:
+                pass
+            if done % 20 == 0 or done == total:
+                print(f"  [{done}/{total}]", end="\r", flush=True)
+
+    print()
+    return good
+
+
+# ──────────────────────────────────────────────
+# Итоговый вывод
 # ──────────────────────────────────────────────
 
 def print_results(results: list, target_ip: str):
-    print("\n" + "═" * 65)
-    print(f"  Результаты сканирования для IP: {target_ip}")
-    print(f"  Найдено кандидатов: {len(results)}")
-    print("═" * 65)
-
+    print("\n" + "═" * 80)
+    print(f"  SNI-кандидаты для {target_ip}  —  найдено: {len(results)}")
+    print("═" * 80)
     if not results:
         print("  Подходящих хостов не найдено.")
         return
 
-    # Сортировка: сначала h2
-    results.sort(key=lambda x: (not x.get("http2"), x.get("hostname", "")))
-
-    print(f"\n  {'IP':<16}  {'Hostname':<38}  {'TLS':<8}  {'ALPN':<6}  {'Cert CN'}")
-    print("  " + "-" * 95)
+    results.sort(key=lambda x: (not x["h2"], x["hostname"]))
+    print(f"\n  {'IP':<16}  {'Hostname':<38}  {'TLS':<8}  {'ALPN':<4}  Сайт")
+    print("  " + "─" * 100)
     for r in results:
-        alpn = r.get("alpn") or "-"
-        cn = r.get("cert_cn") or "-"
-        tls = r.get("tls_version") or "-"
-        h2mark = " [H2]" if r.get("http2") else ""
-        print(f"  {r['ip']:<16}  {r['hostname']:<38}  {tls:<8}  {alpn:<6}  {cn}{h2mark}")
+        site = r["http_title"] or r["http_location"] or str(r["http_status"] or "")
+        h2   = " [H2]" if r["h2"] else ""
+        print(f"  {r['ip']:<16}  {r['hostname']:<38}  "
+              f"{r['tls_version']:<8}  {(r['alpn'] or '-'):<4}  {site[:50]}{h2}")
 
-    print("\n  Лучшие кандидаты для VLESS SNI (HTTP/2):")
-    h2 = [r for r in results if r.get("http2")]
-    if h2:
-        for r in h2[:10]:
+    h2_list = [r for r in results if r["h2"]]
+    if h2_list:
+        print(f"\n  Лучшие (HTTP/2):")
+        for r in h2_list[:10]:
             print(f"    → {r['hostname']}  ({r['ip']})")
-    else:
-        print("    Хостов с HTTP/2 не найдено. Используйте любой из списка выше.")
-
-    print()
-
-    # Сохранение в файл
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_file = f"sni_results_{target_ip.replace('.', '_')}_{ts}.txt"
-    with open(out_file, "w") as f:
-        f.write(f"# SNI VLESS кандидаты для {target_ip}\n")
-        f.write(f"# Дата: {datetime.now().isoformat()}\n\n")
-        for r in results:
-            f.write(f"{r['ip']}\t{r['hostname']}\t{r.get('tls_version','')}\t"
-                    f"{'h2' if r.get('http2') else 'h1'}\t{r.get('cert_cn','')}\n")
-    print(f"  Результаты сохранены: {out_file}")
 
 
 # ──────────────────────────────────────────────
-# Главная функция
+# Точка входа
 # ──────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Поиск SNI VLESS кандидатов в подсети или ASN"
+        description="SNI VLESS Scanner — поиск доменов для SNI в подсети/ASN"
     )
-    parser.add_argument("ip", help="Целевой IP-адрес")
-    parser.add_argument(
-        "--mode", choices=["subnet", "asn", "both"], default="both",
-        help="Режим сканирования (default: both)"
-    )
-    parser.add_argument("--subnet-prefix", type=int, default=24,
-                        help="Длина маски подсети (default: 24, т.е. /24)")
-    parser.add_argument("--threads", type=int, default=50,
-                        help="Число потоков (default: 50)")
-    parser.add_argument("--timeout", type=float, default=3.0,
-                        help="Таймаут соединения в секундах (default: 3)")
-    parser.add_argument("--port", type=int, default=443,
-                        help="Порт TLS (default: 443)")
-    parser.add_argument("--max-hosts", type=int, default=1000,
-                        help="Максимум IP для сканирования из ASN (default: 1000)")
+    parser.add_argument("ip",              help="Целевой IP-адрес")
+    parser.add_argument("--mode",          choices=["subnet", "asn", "both"], default="both")
+    parser.add_argument("--subnet-prefix", type=int,   default=24)
+    parser.add_argument("--threads",       type=int,   default=50)
+    parser.add_argument("--timeout",       type=float, default=3.0)
+    parser.add_argument("--port",          type=int,   default=443)
+    parser.add_argument("--max-hosts",     type=int,   default=1000)
     args = parser.parse_args()
 
     print("╔══════════════════════════════════════════╗")
-    print("║        SNI VLESS Scanner  v1.0           ║")
+    print("║        SNI VLESS Scanner  v2.0           ║")
     print("╚══════════════════════════════════════════╝\n")
 
     target = args.ip
-
-    # Валидация IP
     try:
         ipaddress.ip_address(target)
     except ValueError:
         print(f"[!] Неверный IP: {target}")
         sys.exit(1)
 
-    print(f"[*] Целевой IP: {target}")
-    print(f"[*] Режим: {args.mode}  |  Потоки: {args.threads}  |  Таймаут: {args.timeout}s")
+    print(f"[*] Целевой IP : {target}")
+    print(f"[*] Режим      : {args.mode}  |  Потоки: {args.threads}  |  Таймаут: {args.timeout}s")
 
-    # Получаем информацию об IP
-    print("\n[*] Получаем информацию об IP...")
     info = get_ip_info(target)
     if info:
-        org = info.get("org", "N/A")
-        country = info.get("country", "N/A")
-        region = info.get("region", "N/A")
-        print(f"    Организация : {org}")
-        print(f"    Страна      : {country} / {region}")
-        if "bogon" in info:
-            print("    [!] Это bogon/частный адрес")
+        print(f"    Организация: {info.get('org', 'N/A')}")
+        print(f"    Страна     : {info.get('country', 'N/A')} / {info.get('region', 'N/A')}")
 
-    # Извлекаем ASN
     asn = None
-    org_field = info.get("org", "")
-    m = re.match(r"(AS\d+)", org_field)
+    m = re.match(r"(AS\d+)", info.get("org", ""))
     if m:
         asn = m.group(1)
-        print(f"    ASN         : {asn}")
+        print(f"    ASN        : {asn}")
 
-    ips_to_scan = set()
+    ips_to_scan: set = set()
 
-    # Режим: подсеть
     if args.mode in ("subnet", "both"):
-        subnet = subnet_from_ip(target, args.subnet_prefix)
-        print(f"\n[*] Подсеть /{args.subnet_prefix}: {subnet}")
-        net = ipaddress.ip_network(subnet, strict=False)
-        subnet_ips = [str(h) for h in net.hosts()]
-        print(f"    Хостов в подсети: {len(subnet_ips)}")
-        ips_to_scan.update(subnet_ips)
+        ips = subnet_ips(target, args.subnet_prefix)
+        print(f"\n[*] Подсеть /{args.subnet_prefix}: {len(ips)} хостов")
+        ips_to_scan.update(ips)
 
-    # Режим: ASN
-    if args.mode in ("asn", "both") and asn:
-        print(f"\n[*] Получаем префиксы для {asn}...")
-        prefixes = get_asn_prefixes(asn)
-        if prefixes:
-            print(f"    Найдено префиксов: {len(prefixes)}")
-            asn_ips = ips_from_prefixes(prefixes, max_hosts=args.max_hosts)
-            print(f"    IP для сканирования из ASN: {len(asn_ips)} (лимит: {args.max_hosts})")
-            ips_to_scan.update(asn_ips)
+    if args.mode in ("asn", "both"):
+        if asn:
+            print(f"[*] Получаем префиксы {asn}...")
+            prefixes = get_asn_prefixes(asn)
+            if prefixes:
+                asn_ips = ips_from_prefixes(prefixes, args.max_hosts)
+                print(f"    Префиксов: {len(prefixes)}, IP: {len(asn_ips)}")
+                ips_to_scan.update(asn_ips)
+            else:
+                print("    [!] Префиксы не получены")
         else:
-            print("    [!] Не удалось получить префиксы ASN")
-    elif args.mode in ("asn", "both") and not asn:
-        print("\n[!] ASN не определён, пропускаем ASN-сканирование")
+            print("[!] ASN не определён")
 
     ips_list = sorted(ips_to_scan, key=lambda x: ipaddress.ip_address(x))
-    print(f"\n[*] Всего уникальных IP для сканирования: {len(ips_list)}")
-    print("[*] Начинаем сканирование...\n")
+    print(f"\n[*] Всего IP для сканирования: {len(ips_list)}")
+    print("[*] Начинаем...\n")
 
-    results = scan_range(ips_list, timeout=args.timeout,
-                         threads=args.threads, port=args.port)
+    ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base   = f"sni_results_{target.replace('.', '_')}_{ts}"
+    writer = ResultWriter(txt_path=base + ".txt", log_path=base + ".log")
+
+    results = []
+    try:
+        results = scan_range(
+            ips_list,
+            port=args.port,
+            timeout=args.timeout,
+            threads=args.threads,
+            writer=writer,
+        )
+    except KeyboardInterrupt:
+        print("\n[!] Прервано.")
+    finally:
+        writer.finalize()
 
     print_results(results, target)
 

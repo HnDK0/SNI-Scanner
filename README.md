@@ -26,10 +26,11 @@
 ### Требования
 
 - Python 3.9 и выше
-- Библиотека `requests` — опционально, но ускоряет работу
+- `requests` — опционально, ускоряет HTTP-запросы к ipinfo.io / bgpview.io
+- `cryptography` — опционально, улучшает извлечение CN/SAN из сертификатов
 
 ```
-pip install requests
+pip install requests cryptography
 ```
 
 ### Клонировать репозиторий
@@ -254,6 +255,7 @@ pip install requests
 | `concurrent.futures` | встроенная | Параллельное сканирование |
 | `urllib` | встроенная | HTTP-запросы (резервный вариант) |
 | `requests` | опциональная | HTTP-запросы к ipinfo.io / bgpview.io |
+| `cryptography` | опциональная | Точное извлечение CN/SAN из сертификатов |
 
 ---
 
