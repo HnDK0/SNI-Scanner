@@ -55,16 +55,23 @@ def get_ip_info(ip: str) -> dict:
 
 def get_asn_prefixes(asn: str) -> list:
     asn_num = asn.upper().lstrip("AS")
-    url = f"https://api.bgpview.io/asn/{asn_num}/prefixes"
+    # Используем RIPE Stat — надёжнее bgpview
+    url = f"https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS{asn_num}&sourceapp=sni-scanner"
     try:
         if HAS_REQUESTS:
             data = requests.get(url, timeout=10).json()
         else:
             with urllib.request.urlopen(url, timeout=10) as r:
                 data = json.loads(r.read().decode())
-        return [p["prefix"] for p in data.get("data", {}).get("ipv4_prefixes", [])]
+        prefixes = []
+        for p in data.get("data", {}).get("prefixes", []):
+            prefix = p.get("prefix", "")
+            # Только IPv4
+            if ":" not in prefix:
+                prefixes.append(prefix)
+        return prefixes
     except Exception as e:
-        print(f"[!] bgpview недоступен: {e}")
+        print(f"[!] RIPE Stat недоступен: {e}")
         return []
 
 
@@ -288,6 +295,10 @@ def scan_ip(ip: str, port: int, timeout: float) -> dict:
     if tls["version"] not in ("TLSv1.2", "TLSv1.3"):
         result["fail_step"]   = "tls"
         result["fail_reason"] = f"old_tls:{tls['version']}"
+        return result
+    if not tls["h2"]:
+        result["fail_step"]   = "tls"
+        result["fail_reason"] = "no_h2"
         return result
 
     # Проверка CN — сертификат должен относиться к этому домену.
