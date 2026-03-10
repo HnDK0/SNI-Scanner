@@ -367,53 +367,49 @@ class ResultWriter:
         ts       = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         ip       = r["ip"]
         hostname = r["hostname"] or ""
+        status   = "PASS" if r["good"] else "FAIL"
 
-        # Строим цепочку шагов — каждый OK или FAIL с деталями
-        steps = []
+        # Базовые поля всегда присутствуют
+        fields = [f"ip={ip}", f"domain={hostname if hostname else 'none'}"]
 
-        # rdns
-        if hostname:
-            steps.append(f"rdns=OK({hostname})")
-        else:
-            steps.append("rdns=FAIL(no_rdns)")
-
-        # dns
+        # dns — только если прошли rdns
         if r["fail_step"] != "rdns":
             if r["dns_match"]:
-                steps.append(f"dns=OK({ip})")
+                fields.append("dns=OK")
             else:
                 resolved = ",".join(r["dns_ips"][:3]) if r["dns_ips"] else "nxdomain"
-                steps.append(f"dns=FAIL(resolves_to={resolved})")
+                fields.append(f"dns=MISMATCH({resolved})")
 
-        # tls
+        # tls — только если прошли dns
         if r["fail_step"] not in ("rdns", "dns"):
             if r["tls_ok"]:
-                alpn = "h2" if r["h2"] else "h1"
-                steps.append(f"tls=OK({r['tls_version']}/{alpn})")
+                fields.append(f"tls={r['tls_version']}")
+                fields.append(f"h2={'yes' if r['h2'] else 'no'}")
             else:
-                steps.append(f"tls=FAIL({r['fail_reason']})")
+                fields.append(f"tls=FAIL({r['fail_reason']})")
 
-        # cert
+        # cert — только если прошли tls
         if r["fail_step"] not in ("rdns", "dns", "tls"):
             cert_cn = r["cert_cn"] or ""
             if r["fail_step"] == "cert":
-                steps.append(f"cert=FAIL({cert_cn} != hostname)")
+                fields.append(f"cert=MISMATCH({cert_cn})")
             else:
-                steps.append(f"cert=OK({cert_cn})" if cert_cn else "cert=OK")
+                fields.append("cert=match")
 
-        # http
+        # http — только если прошли cert
         if r["fail_step"] not in ("rdns", "dns", "tls", "cert"):
             if r["good"]:
-                title = f'"{r["http_title"][:40]}"' if r["http_title"] else ""
-                loc   = f">{r['http_location'][:40]}" if r["http_location"] else ""
-                srv   = f"[{r['http_server'][:20]}]" if r["http_server"] else ""
-                info  = " ".join(filter(None, [str(r["http_status"]), title, loc, srv]))
-                steps.append(f"http=OK({info})")
+                fields.append(f"http={r['http_status']}")
+                if r["http_server"]:
+                    fields.append(f"server={r['http_server'][:30]}")
+                if r["http_title"]:
+                    fields.append(f"title=\"{r['http_title'][:50]}\"")
+                elif r["http_location"]:
+                    fields.append(f"redirect={r['http_location'][:50]}")
             else:
-                steps.append(f"http=FAIL({r['fail_reason']})")
+                fields.append(f"http=FAIL({r['fail_reason']})")
 
-        status = "PASS" if r["good"] else "FAIL"
-        self._log.append(f"[{ts}] {status}  {ip:<16}  " + "  |  ".join(steps))
+        self._log.append(f"[{ts}] {status}  " + "  ".join(fields))
 
         if r["good"]:
             self.passed += 1
