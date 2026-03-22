@@ -26,7 +26,6 @@ import ssl
 import sys
 import json
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
@@ -86,16 +85,21 @@ def ips_from_prefixes(prefixes: list, max_hosts: int) -> list:
     for prefix in shuffled:
         try:
             net = ipaddress.ip_network(prefix, strict=False)
-            all_ips.extend(str(h) for h in net.hosts())
-            if len(all_ips) >= max_hosts:
-                break
+            # FIX: ленивая итерация — не загружаем весь /8 (16M IP) в память сразу
+            for host in net.hosts():
+                all_ips.append(str(host))
+                if len(all_ips) >= max_hosts:
+                    return all_ips
         except ValueError:
             pass
-    return all_ips[:max_hosts]
+    return all_ips
 
 
 def subnet_ips(ip: str, prefix_len: int) -> list:
     net = ipaddress.ip_network(f"{ip}/{prefix_len}", strict=False)
+    count = net.num_addresses
+    if count > 10000:
+        print(f"[!] Предупреждение: подсеть /{prefix_len} содержит {count - 2} хостов — сканирование займёт много времени.")
     return [str(h) for h in net.hosts()]
 
 
@@ -114,13 +118,131 @@ def rdns(ip: str) -> str | None:
 # Шаг 2: DNS-резолвинг — проверяем что домен смотрит на этот IP
 # ──────────────────────────────────────────────
 
-def resolve_hostname(hostname: str) -> list:
-    """Возвращает список всех A-записей для hostname."""
-    try:
-        infos = socket.getaddrinfo(hostname, None, socket.AF_INET)
-        return list({i[4][0] for i in infos})
-    except Exception:
+def resolve_hostname(hostname: str, dns_server: str = "8.8.8.8") -> list:
+    """
+    Возвращает список A-записей для hostname.
+
+    Если dns_server начинается с "https://" — использует DoH (DNS-over-HTTPS).
+    Это единственный способ обойти fake-dns (v2rayN и аналоги), который
+    перехватывает все запросы на порт 53 и возвращает 198.18.x.x.
+
+    Иначе — прямой DNS по UDP с fallback на TCP к тому же серверу.
+    Системный резолвер (getaddrinfo) намеренно не используется.
+    """
+    import struct
+
+    def _skip_name(data: bytes, offset: int) -> int:
+        while offset < len(data):
+            length = data[offset]
+            if length & 0xC0 == 0xC0:
+                return offset + 2
+            if length == 0:
+                return offset + 1
+            offset += 1 + length
+        return offset
+
+    def _build_query(name: str) -> bytes:
+        header = struct.pack(">HHHHHH", 0x1337, 0x0100, 1, 0, 0, 0)
+        labels = b""
+        for part in name.encode().split(b"."):
+            labels += bytes([len(part)]) + part
+        labels += b"\x00"
+        return header + labels + struct.pack(">HH", 1, 1)
+
+    def _parse_a_records(data: bytes) -> list:
+        if len(data) < 12:
+            return []
+        ancount = struct.unpack(">H", data[6:8])[0]
+        if ancount == 0:
+            return []
+        offset = 12
+        qdcount = struct.unpack(">H", data[4:6])[0]
+        for _ in range(qdcount):
+            offset = _skip_name(data, offset)
+            offset += 4
+        ips = []
+        for _ in range(ancount):
+            if offset >= len(data):
+                break
+            offset = _skip_name(data, offset)
+            if offset + 10 > len(data):
+                break
+            rtype, _rclass, _ttl, rdlen = struct.unpack(">HHIH", data[offset:offset+10])
+            offset += 10
+            if rtype == 1 and rdlen == 4 and offset + 4 <= len(data):
+                ips.append(".".join(str(b) for b in data[offset:offset+4]))
+            offset += rdlen
+        return ips
+
+    def _warn_if_fake(ips, transport):
+        if any(ip.startswith("198.18.") for ip in ips):
+            import sys
+            print(f"\n  [!] fake-dns / DNS-перехват ({transport}): получены {ips} для {hostname!r}", file=sys.stderr)
+            print(f"      Используйте --dns https://dns.google/dns-query (DoH) чтобы обойти.", file=sys.stderr)
+
+    # ── DoH (DNS-over-HTTPS) ───────────────────────────────────────────────
+    if dns_server.startswith("https://"):
+        try:
+            query = _build_query(hostname)
+            import base64
+            dns_param = base64.urlsafe_b64encode(query).rstrip(b"=").decode()
+            url = f"{dns_server}?dns={dns_param}"
+            # Используем urllib чтобы не зависеть от requests
+            req = urllib.request.Request(
+                url,
+                headers={"Accept": "application/dns-message",
+                         "User-Agent": "sni-scanner/1.0"}
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                response = resp.read()
+            ips = _parse_a_records(response)
+            if ips:
+                _warn_if_fake(ips, "DoH")
+                return ips
+        except Exception as e:
+            import sys
+            print(f"  [!] DoH ошибка ({dns_server}): {e}", file=sys.stderr)
         return []
+
+    # ── UDP ────────────────────────────────────────────────────────────────
+    try:
+        query = _build_query(hostname)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(3.0)
+            sock.sendto(query, (dns_server, 53))
+            response, _ = sock.recvfrom(4096)
+        if len(response) >= 3 and (response[2] & 0x02):
+            raise ValueError("truncated")
+        ips = _parse_a_records(response)
+        if ips:
+            _warn_if_fake(ips, "UDP")
+            return ips
+    except Exception:
+        pass
+
+    # ── TCP (если UDP заблокирован или ответ обрезан) ──────────────────────
+    try:
+        query = _build_query(hostname)
+        tcp_msg = struct.pack(">H", len(query)) + query
+        with socket.create_connection((dns_server, 53), timeout=4.0) as sock:
+            sock.sendall(tcp_msg)
+            raw_len = sock.recv(2)
+            if len(raw_len) == 2:
+                msg_len = struct.unpack(">H", raw_len)[0]
+                response = b""
+                while len(response) < msg_len:
+                    chunk = sock.recv(msg_len - len(response))
+                    if not chunk:
+                        break
+                    response += chunk
+                ips = _parse_a_records(response)
+                if ips:
+                    _warn_if_fake(ips, "TCP")
+                    return ips
+    except Exception:
+        pass
+
+    return []
 
 
 # ──────────────────────────────────────────────
@@ -152,7 +274,10 @@ def _cn_from_der(der: bytes) -> str | None:
         except Exception:
             pass
         if cn_via_lib is None:
-            attrs = cert.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                attrs = cert.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)
             cn_via_lib = attrs[0].value if attrs else None
     except ImportError:
         pass
@@ -162,11 +287,7 @@ def _cn_from_der(der: bytes) -> str | None:
     if cn_via_lib is not None:
         return cn_via_lib
 
-    if lib_available:
-        # Библиотека была, но не смогла распарсить — больше не пробуем
-        return None
-
-    # Fallback: ищем OID 55 04 03 (commonName) прямо в байтах DER
+    # Fallback: ищем OID 55 04 03 (commonName) прямо в байтах DER.
     try:
         i = 0
         while i < len(der) - 5:
@@ -270,7 +391,43 @@ def check_http(ip: str, hostname: str, port: int, timeout: float) -> dict:
 # Полная проверка одного IP
 # ──────────────────────────────────────────────
 
-def scan_ip(ip: str, port: int, timeout: float) -> dict:
+def cert_cn_no_sni(ip: str, port: int, timeout: float) -> tuple:
+    """
+    Подключается к IP и читает CN/SAN из сертификата без SNI.
+    Используется в режиме --skip-rdns когда PTR не настроен.
+
+    Возвращает (hostname, error_reason).
+    При успехе: (hostname, None). При ошибке: (None, "причина").
+
+    server_hostname=IP — по RFC 6066 OpenSSL не добавляет SNI
+    когда hostname является IP-адресом. Работает на Win/Linux/macOS.
+    """
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        with socket.create_connection((ip, port), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=ip) as tls:
+                der = tls.getpeercert(binary_form=True)
+                if der:
+                    cn = _cn_from_der(der)
+                    if cn:
+                        return cn, None
+                    return None, "der_no_cn"
+                return None, "no_der"
+    except ssl.SSLError as e:
+        return None, f"ssl:{e.reason or e}"
+    except (socket.timeout, TimeoutError):
+        return None, "timeout"
+    except ConnectionRefusedError:
+        return None, "refused"
+    except OSError as e:
+        return None, f"oserr:{e.errno}"
+    except Exception as e:
+        return None, f"{type(e).__name__}"
+
+
+def scan_ip(ip: str, port: int, timeout: float, skip_rdns: bool = False, dns_server: str = "8.8.8.8") -> dict:
     result = {
         "ip":            ip,
         "hostname":      None,
@@ -291,22 +448,50 @@ def scan_ip(ip: str, port: int, timeout: float) -> dict:
         "fail_reason":   None,
     }
 
-    # Шаг 1: rDNS
-    hostname = rdns(ip)
-    if not hostname:
-        result["fail_step"]   = "rdns"
-        result["fail_reason"] = "no_rdns"
-        return result
-    result["hostname"] = hostname
+    if skip_rdns:
+        # ── Режим --skip-rdns ──────────────────────────────────────────────
+        # Шаг 1а: читаем CN прямо из сертификата (без PTR)
+        hostname, cn_err = cert_cn_no_sni(ip, port, timeout)
+        if not hostname:
+            result["fail_step"]   = "rdns"
+            result["fail_reason"] = f"no_cert_cn({cn_err})"
+            return result
+        # Убираем wildcard-префикс если есть (*.example.com → example.com)
+        if hostname.startswith("*."):
+            hostname = hostname[2:]
+        if not hostname:
+            result["fail_step"]   = "rdns"
+            result["fail_reason"] = "empty_wildcard"
+            return result
+        result["hostname"] = hostname
 
-    # Шаг 2: DNS → должен резолвиться на этот IP
-    dns_ips = resolve_hostname(hostname)
-    result["dns_ips"] = dns_ips
-    if ip not in dns_ips:
-        result["fail_step"]   = "dns"
-        result["fail_reason"] = f"dns_mismatch({','.join(dns_ips) if dns_ips else 'nxdomain'})"
-        return result
-    result["dns_match"] = True
+        # Шаг 2а: DNS → домен из сертификата должен резолвиться на этот IP
+        dns_ips = resolve_hostname(hostname, dns_server)
+        result["dns_ips"] = dns_ips
+        if ip not in dns_ips:
+            result["fail_step"]   = "dns"
+            result["fail_reason"] = f"dns_mismatch({','.join(dns_ips) if dns_ips else 'nxdomain'})"
+            return result
+        result["dns_match"] = True
+
+    else:
+        # ── Стандартный режим ──────────────────────────────────────────────
+        # Шаг 1: rDNS
+        hostname = rdns(ip)
+        if not hostname:
+            result["fail_step"]   = "rdns"
+            result["fail_reason"] = "no_rdns"
+            return result
+        result["hostname"] = hostname
+
+        # Шаг 2: DNS → должен резолвиться на этот IP
+        dns_ips = resolve_hostname(hostname, dns_server)
+        result["dns_ips"] = dns_ips
+        if ip not in dns_ips:
+            result["fail_step"]   = "dns"
+            result["fail_reason"] = f"dns_mismatch({','.join(dns_ips) if dns_ips else 'nxdomain'})"
+            return result
+        result["dns_match"] = True
 
     # Шаг 3: TLS
     tls = check_tls(ip, hostname, port, timeout)
@@ -388,14 +573,15 @@ class ResultWriter:
     при параллельной записи из 50+ потоков.
     """
 
-    def __init__(self, txt_path: str, log_path: str):
+    def __init__(self, txt_path: str, log_path: str, flush_every: int = 50):
         self.txt_path    = txt_path
         self.log_path    = log_path
         self._good: list = []
         self._log:  list = []
         self.total       = 0
         self.passed      = 0
-        self._lock       = threading.Lock()   # FIX #4
+        self._lock       = threading.Lock()
+        self._flush_every = flush_every
 
     def add(self, r: dict):
         with self._lock:                      # FIX #4
@@ -447,8 +633,9 @@ class ResultWriter:
                 site = r["http_title"] or r["http_location"] or str(r["http_status"] or "")
                 h2_mark = " [H2]" if r["h2"] else ""
                 self._good.append(f"{hostname:<45}  {r['ip']:<16}  {site[:60]}{h2_mark}")
-
-            self._flush()
+                self._flush()  # сразу пишем найденный кандидат
+            elif self.total % self._flush_every == 0:
+                self._flush()  # периодический сброс лога
 
     def _flush(self):
         self._write_atomic(self.txt_path, "\n".join(self._good) + "\n" if self._good else "")
@@ -478,13 +665,13 @@ class ResultWriter:
 # ──────────────────────────────────────────────
 
 def scan_range(ips: list, port: int, timeout: float,
-               threads: int, writer: ResultWriter) -> list:
+               threads: int, writer: ResultWriter, skip_rdns: bool = False, dns_server: str = "8.8.8.8") -> list:
     good  = []
     total = len(ips)
     done  = 0
 
     with ThreadPoolExecutor(max_workers=threads) as ex:
-        futures = {ex.submit(scan_ip, ip, port, timeout): ip for ip in ips}
+        futures = {ex.submit(scan_ip, ip, port, timeout, skip_rdns, dns_server): ip for ip in ips}
         for fut in as_completed(futures):
             done += 1
             try:
@@ -495,8 +682,9 @@ def scan_range(ips: list, port: int, timeout: float,
                     mark = "h2" if r["h2"] else "h1"
                     site = r["http_title"] or r["http_location"] or str(r["http_status"] or "")
                     print(f"  ✓ {r['ip']:<16}  {r['hostname']:<42}  {mark}  {site[:50]}")
-            except Exception:
-                pass
+            except Exception as e:
+                ip = futures[fut]
+                print(f"  [!] Ошибка потока для {ip}: {type(e).__name__}: {e}")
             if done % 20 == 0 or done == total:
                 print(f"  [{done}/{total}]", end="\r", flush=True)
 
@@ -538,6 +726,113 @@ def print_results(results: list, target_ip: str):
             print(f"    → {r['hostname']}  ({r['ip']})")
 
 
+
+# ──────────────────────────────────────────────
+# Диагностика одного IP (--probe)
+# ──────────────────────────────────────────────
+
+def probe_ip(ip: str, port: int, timeout: float, skip_rdns: bool, dns_server: str = "8.8.8.8"):
+    """Детальная диагностика одного IP — показывает каждый шаг с результатом."""
+    print(f"\n  Диагностика: {ip}:{port}  (timeout={timeout}s)\n")
+
+    # Шаг 1: TCP
+    print("  [1] TCP-соединение...", end=" ")
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            print("OK")
+    except (socket.timeout, TimeoutError):
+        print("FAIL — таймаут. Порт закрыт или фаерволл.")
+        return
+    except ConnectionRefusedError:
+        print("FAIL — соединение отклонено. Порт не слушает.")
+        return
+    except OSError as e:
+        print(f"FAIL — {e}")
+        return
+
+    # Шаг 2: TLS без SNI (для --skip-rdns)
+    if skip_rdns:
+        print("  [2] TLS без SNI (читаем CN из сертификата)...", end=" ")
+        cn, err = cert_cn_no_sni(ip, port, timeout)
+        if cn:
+            print(f"OK → CN/SAN = {cn!r}")
+        else:
+            print(f"FAIL — {err}")
+            if err and "ssl:" in err:
+                print("      Сервер требует SNI или отклоняет соединение без него.")
+            elif err == "no_der":
+                print("      TLS установлен, но сервер не вернул сертификат.")
+            elif err == "der_no_cn":
+                print("      Сертификат есть, но CN/SAN не найден (нестандартный формат).")
+            elif err == "timeout":
+                print("      TLS-handshake завис. Попробуйте --timeout 8.0")
+            return
+        hostname = cn.lstrip("*.")
+        if not hostname:
+            print("  FAIL — CN после strip пуст.")
+            return
+    else:
+        print("  [2] rDNS (PTR-запрос)...", end=" ")
+        hostname = rdns(ip)
+        if hostname:
+            print(f"OK → {hostname}")
+        else:
+            print("FAIL — PTR не настроен. Используйте --skip-rdns.")
+            return
+
+    # Шаг 3: DNS forward
+    print(f"  [3] DNS резолвинг {hostname!r}...", end=" ")
+    dns_ips = resolve_hostname(hostname, dns_server)
+    if not dns_ips:
+        print(f"FAIL — домен не резолвится (NXDOMAIN).")
+        return
+    if ip in dns_ips:
+        print(f"OK → {dns_ips}")
+    else:
+        print(f"FAIL — домен резолвится на {dns_ips}, а не на {ip}.")
+        return
+
+    # Шаг 4: TLS с SNI
+    print(f"  [4] TLS с SNI={hostname!r}...", end=" ")
+    tls = check_tls(ip, hostname, port, timeout)
+    if tls["ok"]:
+        print(f"OK → {tls['version']}, ALPN={tls['alpn']}, H2={tls['h2']}, CN={tls['cert_cn']!r}")
+    else:
+        print(f"FAIL — {tls['error']}")
+        return
+
+    # Шаг 5: CN-матч
+    print("  [5] Проверка CN...", end=" ")
+    cert_cn = tls["cert_cn"] or ""
+    cn_base = cert_cn.lstrip("*.")
+    cn_match = (
+        cert_cn == hostname
+        or cert_cn == f"*.{hostname.split('.', 1)[-1]}"
+        or (cn_base and hostname.endswith("." + cn_base))
+        or cn_base == hostname
+        or (cert_cn and hostname.endswith("." + cert_cn))
+    )
+    if cn_match:
+        print(f"OK")
+    else:
+        print(f"FAIL — сертификат {cert_cn!r} не совпадает с {hostname!r}.")
+        return
+
+    # Шаг 6: HTTP
+    print(f"  [6] HTTP GET /...", end=" ")
+    http = check_http(ip, hostname, port, timeout)
+    if http["no_http"]:
+        print("FAIL — ответ не является HTTP (возможно Reality на этом IP).")
+    elif http["error"]:
+        print(f"FAIL — {http['error']}")
+    elif http["status"]:
+        print(f"OK → HTTP {http['status']}, server={http['server']!r}, title={http['title']!r}")
+    else:
+        print("FAIL — нет статуса.")
+        return
+
+    print(f"\n  ✓ {hostname} подходит для VLESS Reality!")
+
 # ──────────────────────────────────────────────
 # Точка входа
 # ──────────────────────────────────────────────
@@ -553,10 +848,23 @@ def main():
     parser.add_argument("--timeout",       type=float, default=3.0)
     parser.add_argument("--port",          type=int,   default=443)
     parser.add_argument("--max-hosts",     type=int,   default=1000)
+    parser.add_argument("--skip-rdns",     action="store_true",
+                        help="Не делать PTR-запрос: брать hostname из CN сертификата. "
+                             "Используйте когда rDNS не настроен в подсети.")
+    parser.add_argument("--probe",          action="store_true",
+                        help="Режим диагностики одного IP: показывает каждый шаг подробно.")
+    parser.add_argument("--dns",            default="8.8.8.8",
+                        help="DNS для резолвинга. Примеры: 8.8.8.8, 1.1.1.1, "
+                             "https://dns.google/dns-query (DoH). "
+                             "DoH обходит fake-dns и перехват на порту 53.")
     args = parser.parse_args()
 
+    if args.threads > 200:
+        print(f"[!] --threads {args.threads} слишком много, ограничиваем до 200 (ulimit)")
+        args.threads = 200
+
     print("╔══════════════════════════════════════════╗")
-    print("║        SNI VLESS Scanner  v2.1           ║")
+    print("║        SNI VLESS Scanner  v2.2           ║")
     print("╚══════════════════════════════════════════╝\n")
 
     target = args.ip
@@ -566,8 +874,18 @@ def main():
         print(f"[!] Неверный IP: {target}")
         sys.exit(1)
 
+    if args.probe:
+        probe_ip(target, args.port, args.timeout, args.skip_rdns, args.dns)
+        return
+
     print(f"[*] Целевой IP : {target}")
     print(f"[*] Режим      : {args.mode}  |  Потоки: {args.threads}  |  Таймаут: {args.timeout}s")
+    if args.skip_rdns:
+        print("[*] skip-rdns  : ВКЛ — hostname берётся из CN сертификата")
+    if args.dns.startswith("https://"):
+        print(f"[*] DNS-сервер : {args.dns}  [DoH]")
+    else:
+        print(f"[*] DNS-сервер : {args.dns}")
 
     info = get_ip_info(target)
     if info:
@@ -622,6 +940,8 @@ def main():
             timeout=args.timeout,
             threads=args.threads,
             writer=writer,
+            skip_rdns=args.skip_rdns,
+            dns_server=args.dns,
         )
     except KeyboardInterrupt:
         print("\n[!] Прервано.")
