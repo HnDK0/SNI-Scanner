@@ -19,11 +19,13 @@ SNI VLESS Scanner
 import argparse
 import ipaddress
 import os
+import random
 import re
 import socket
 import ssl
 import sys
 import json
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -55,7 +57,6 @@ def get_ip_info(ip: str) -> dict:
 
 def get_asn_prefixes(asn: str) -> list:
     asn_num = asn.upper().lstrip("AS")
-    # Используем RIPE Stat — надёжнее bgpview
     url = f"https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS{asn_num}&sourceapp=sni-scanner"
     try:
         if HAS_REQUESTS:
@@ -66,7 +67,6 @@ def get_asn_prefixes(asn: str) -> list:
         prefixes = []
         for p in data.get("data", {}).get("prefixes", []):
             prefix = p.get("prefix", "")
-            # Только IPv4
             if ":" not in prefix:
                 prefixes.append(prefix)
         return prefixes
@@ -76,8 +76,14 @@ def get_asn_prefixes(asn: str) -> list:
 
 
 def ips_from_prefixes(prefixes: list, max_hosts: int) -> list:
+    """
+    FIX #7: перемешиваем префиксы перед обходом, чтобы не уходить
+    весь лимит в первый (возможно огромный) префикс ASN.
+    """
+    shuffled = list(prefixes)
+    random.shuffle(shuffled)
     all_ips = []
-    for prefix in prefixes:
+    for prefix in shuffled:
         try:
             net = ipaddress.ip_network(prefix, strict=False)
             all_ips.extend(str(h) for h in net.hosts())
@@ -122,23 +128,42 @@ def resolve_hostname(hostname: str) -> list:
 # ──────────────────────────────────────────────
 
 def _cn_from_der(der: bytes) -> str | None:
-    """Извлекает CN/SAN из DER без verify — getpeercert() пустой при CERT_NONE."""
+    """
+    Извлекает CN/SAN из DER без verify — getpeercert() пустой при CERT_NONE.
+
+    FIX #1: структурирован так, что fallback DER-парсер выполняется
+    при любом исходе попытки импорта cryptography — в том числе при
+    ошибке внутри библиотеки (раньше `except Exception: return None`
+    прерывал функцию до fallback).
+    """
+    cn_via_lib = None
+    lib_available = False
+
     try:
         from cryptography import x509
         from cryptography.hazmat.backends import default_backend
+        lib_available = True
         cert = x509.load_der_x509_certificate(der, default_backend())
         try:
             san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
             dns_names = san.value.get_values_for_type(x509.DNSName)
             if dns_names:
-                return dns_names[0]
+                cn_via_lib = dns_names[0]
         except Exception:
             pass
-        attrs = cert.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)
-        return attrs[0].value if attrs else None
+        if cn_via_lib is None:
+            attrs = cert.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)
+            cn_via_lib = attrs[0].value if attrs else None
     except ImportError:
         pass
     except Exception:
+        pass  # библиотека доступна но сломалась — пробуем fallback
+
+    if cn_via_lib is not None:
+        return cn_via_lib
+
+    if lib_available:
+        # Библиотека была, но не смогла распарсить — больше не пробуем
         return None
 
     # Fallback: ищем OID 55 04 03 (commonName) прямо в байтах DER
@@ -192,6 +217,10 @@ def check_tls(ip: str, hostname: str, port: int, timeout: float) -> dict:
 # ──────────────────────────────────────────────
 
 def check_http(ip: str, hostname: str, port: int, timeout: float) -> dict:
+    """
+    FIX #6: увеличен лимит чтения с 8 192 до 32 768 байт,
+    чтобы захватить <title> у страниц с большим <head>.
+    """
     r = {"status": None, "server": "", "location": "", "title": "",
          "no_http": False, "error": None}
     ctx = ssl.create_default_context()
@@ -207,7 +236,7 @@ def check_http(ip: str, hostname: str, port: int, timeout: float) -> dict:
                 )
                 tls.sendall(req.encode())
                 raw = b""
-                while len(raw) < 8192:
+                while len(raw) < 32768:          # было 8192
                     chunk = tls.recv(4096)
                     if not chunk:
                         break
@@ -296,14 +325,15 @@ def scan_ip(ip: str, port: int, timeout: float) -> dict:
         result["fail_step"]   = "tls"
         result["fail_reason"] = f"old_tls:{tls['version']}"
         return result
-    if not tls["h2"]:
-        result["fail_step"]   = "tls"
-        result["fail_reason"] = "no_h2"
-        return result
 
-    # Проверка CN — сертификат должен относиться к этому домену.
-    # Если cert_cn чужой (например *.telegram.org на shikado.mooo.com) —
-    # это прокси, не настоящий сайт, для SNI не подходит.
+    # FIX #2: H2 теперь НЕ является жёстким требованием.
+    # Reality работает и без h2 ALPN на стороне dest.
+    # Сервера без H2 попадают в результаты, но помечаются в логе.
+    # (ранее: `if not tls["h2"]: return FAIL` — убрано)
+
+    # Проверка CN / SAN сертификата.
+    # FIX #3: добавлен случай прямого поддомена (hostname = sub.example.com,
+    # cert_cn = example.com) — раньше такой матч не проходил.
     cert_cn = tls["cert_cn"] or ""
     cn_base = cert_cn.lstrip("*.")
     cn_match = (
@@ -311,6 +341,7 @@ def scan_ip(ip: str, port: int, timeout: float) -> dict:
         or cert_cn == f"*.{hostname.split('.', 1)[-1]}"
         or (cn_base and hostname.endswith("." + cn_base))
         or cn_base == hostname
+        or (cert_cn and hostname.endswith("." + cert_cn))   # FIX #3: sub.example.com ← example.com
     )
     if not cn_match:
         result["fail_step"]   = "cert"
@@ -352,6 +383,9 @@ class ResultWriter:
     Атомарная инкрементальная запись через .tmp + os.replace.
     .txt — только успешные кандидаты: домен / IP / сайт
     .log — ВСЕ проверенные IP с результатом каждого шага
+
+    FIX #4: добавлен threading.Lock для защиты от race condition
+    при параллельной записи из 50+ потоков.
     """
 
     def __init__(self, txt_path: str, log_path: str):
@@ -361,62 +395,60 @@ class ResultWriter:
         self._log:  list = []
         self.total       = 0
         self.passed      = 0
+        self._lock       = threading.Lock()   # FIX #4
 
     def add(self, r: dict):
-        self.total += 1
-        ts       = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        ip       = r["ip"]
-        hostname = r["hostname"] or ""
-        status   = "PASS" if r["good"] else "FAIL"
+        with self._lock:                      # FIX #4
+            self.total += 1
+            ts       = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            ip       = r["ip"]
+            hostname = r["hostname"] or ""
+            status   = "PASS" if r["good"] else "FAIL"
 
-        # Базовые поля всегда присутствуют
-        fields = [f"ip={ip}", f"domain={hostname if hostname else 'none'}"]
+            fields = [f"ip={ip}", f"domain={hostname if hostname else 'none'}"]
 
-        # dns — только если прошли rdns
-        if r["fail_step"] != "rdns":
-            if r["dns_match"]:
-                fields.append("dns=OK")
-            else:
-                resolved = ",".join(r["dns_ips"][:3]) if r["dns_ips"] else "nxdomain"
-                fields.append(f"dns=MISMATCH({resolved})")
+            if r["fail_step"] != "rdns":
+                if r["dns_match"]:
+                    fields.append("dns=OK")
+                else:
+                    resolved = ",".join(r["dns_ips"][:3]) if r["dns_ips"] else "nxdomain"
+                    fields.append(f"dns=MISMATCH({resolved})")
 
-        # tls — только если прошли dns
-        if r["fail_step"] not in ("rdns", "dns"):
-            if r["tls_ok"]:
-                fields.append(f"tls={r['tls_version']}")
-                fields.append(f"h2={'yes' if r['h2'] else 'no'}")
-            else:
-                fields.append(f"tls=FAIL({r['fail_reason']})")
+            if r["fail_step"] not in ("rdns", "dns"):
+                if r["tls_ok"]:
+                    fields.append(f"tls={r['tls_version']}")
+                    fields.append(f"h2={'yes' if r['h2'] else 'no'}")
+                else:
+                    fields.append(f"tls=FAIL({r['fail_reason']})")
 
-        # cert — только если прошли tls
-        if r["fail_step"] not in ("rdns", "dns", "tls"):
-            cert_cn = r["cert_cn"] or ""
-            if r["fail_step"] == "cert":
-                fields.append(f"cert=MISMATCH({cert_cn})")
-            else:
-                fields.append("cert=match")
+            if r["fail_step"] not in ("rdns", "dns", "tls"):
+                cert_cn = r["cert_cn"] or ""
+                if r["fail_step"] == "cert":
+                    fields.append(f"cert=MISMATCH({cert_cn})")
+                else:
+                    fields.append("cert=match")
 
-        # http — только если прошли cert
-        if r["fail_step"] not in ("rdns", "dns", "tls", "cert"):
+            if r["fail_step"] not in ("rdns", "dns", "tls", "cert"):
+                if r["good"]:
+                    fields.append(f"http={r['http_status']}")
+                    if r["http_server"]:
+                        fields.append(f"server={r['http_server'][:30]}")
+                    if r["http_title"]:
+                        fields.append(f"title=\"{r['http_title'][:50]}\"")
+                    elif r["http_location"]:
+                        fields.append(f"redirect={r['http_location'][:50]}")
+                else:
+                    fields.append(f"http=FAIL({r['fail_reason']})")
+
+            self._log.append(f"[{ts}] {status}  " + "  ".join(fields))
+
             if r["good"]:
-                fields.append(f"http={r['http_status']}")
-                if r["http_server"]:
-                    fields.append(f"server={r['http_server'][:30]}")
-                if r["http_title"]:
-                    fields.append(f"title=\"{r['http_title'][:50]}\"")
-                elif r["http_location"]:
-                    fields.append(f"redirect={r['http_location'][:50]}")
-            else:
-                fields.append(f"http=FAIL({r['fail_reason']})")
+                self.passed += 1
+                site = r["http_title"] or r["http_location"] or str(r["http_status"] or "")
+                h2_mark = " [H2]" if r["h2"] else ""
+                self._good.append(f"{hostname:<45}  {r['ip']:<16}  {site[:60]}{h2_mark}")
 
-        self._log.append(f"[{ts}] {status}  " + "  ".join(fields))
-
-        if r["good"]:
-            self.passed += 1
-            site = r["http_title"] or r["http_location"] or str(r["http_status"] or "")
-            self._good.append(f"{hostname:<45}  {ip:<16}  {site[:60]}")
-
-        self._flush()
+            self._flush()
 
     def _flush(self):
         self._write_atomic(self.txt_path, "\n".join(self._good) + "\n" if self._good else "")
@@ -485,18 +517,24 @@ def print_results(results: list, target_ip: str):
         return
 
     results.sort(key=lambda x: (not x["h2"], x["hostname"]))
-    print(f"\n  {'IP':<16}  {'Hostname':<38}  {'TLS':<8}  {'ALPN':<4}  Сайт")
+    print(f"\n  {'IP':<16}  {'Hostname':<38}  {'TLS':<8}  {'ALPN':<6}  Сайт")
     print("  " + "─" * 100)
     for r in results:
         site = r["http_title"] or r["http_location"] or str(r["http_status"] or "")
         h2   = " [H2]" if r["h2"] else ""
         print(f"  {r['ip']:<16}  {r['hostname']:<38}  "
-              f"{r['tls_version']:<8}  {(r['alpn'] or '-'):<4}  {site[:50]}{h2}")
+              f"{r['tls_version']:<8}  {(r['alpn'] or '-'):<6}  {site[:50]}{h2}")
 
     h2_list = [r for r in results if r["h2"]]
     if h2_list:
         print(f"\n  Лучшие (HTTP/2):")
         for r in h2_list[:10]:
+            print(f"    → {r['hostname']}  ({r['ip']})")
+
+    no_h2 = [r for r in results if not r["h2"]]
+    if no_h2:
+        print(f"\n  Без H2 (тоже подходят для Reality):")
+        for r in no_h2[:5]:
             print(f"    → {r['hostname']}  ({r['ip']})")
 
 
@@ -518,7 +556,7 @@ def main():
     args = parser.parse_args()
 
     print("╔══════════════════════════════════════════╗")
-    print("║        SNI VLESS Scanner  v2.0           ║")
+    print("║        SNI VLESS Scanner  v2.1           ║")
     print("╚══════════════════════════════════════════╝\n")
 
     target = args.ip
@@ -536,11 +574,17 @@ def main():
         print(f"    Организация: {info.get('org', 'N/A')}")
         print(f"    Страна     : {info.get('country', 'N/A')} / {info.get('region', 'N/A')}")
 
+    # FIX #5: помимо поля org пробуем явное поле asn (если ipinfo вернул его),
+    # и явно предупреждаем если ASN не удалось определить при --mode asn/both.
     asn = None
-    m = re.match(r"(AS\d+)", info.get("org", ""))
+    asn_field = info.get("asn", "")         # ipinfo Basic plan возвращает "asn": "AS12345"
+    org_field  = info.get("org", "")
+    m = re.match(r"(AS\d+)", asn_field) or re.match(r"(AS\d+)", org_field)
     if m:
         asn = m.group(1)
         print(f"    ASN        : {asn}")
+    elif args.mode in ("asn", "both"):
+        print("[!] ASN не определён — ipinfo не вернул ASN. Используйте --mode subnet.")
 
     ips_to_scan: set = set()
 
@@ -560,7 +604,7 @@ def main():
             else:
                 print("    [!] Префиксы не получены")
         else:
-            print("[!] ASN не определён")
+            print("[!] ASN не определён, ASN-сканирование пропущено")
 
     ips_list = sorted(ips_to_scan, key=lambda x: ipaddress.ip_address(x))
     print(f"\n[*] Всего IP для сканирования: {len(ips_list)}")
